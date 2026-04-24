@@ -418,7 +418,7 @@ fn write_text_ops(buf: &mut Vec<u8>, fields: &[TextField], font_name: &str, enc:
         } else {
             let (x, y_td) = anchor_to_xy(field.position, field.dx, field.dy);
             let fs = field.font_size as f64;
-            let y_pdf = PAGE_HEIGHT - y_td - fs * 0.5;
+            let y_pdf = PAGE_HEIGHT - y_td - fs * 0.25;
 
             // Use exact GID-based text width for alignment
             let text_w = enc.text_width(&field.text, fs);

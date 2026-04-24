@@ -1,1 +1,7 @@
 /target
+certificate-cli.pdf
+certificate-multipart.pdf
+certificate-base64.pdf
+certificate-url.pdf
+certificate.pdf
+target/

@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# Demo: REST API — all three image-supply strategies.
+#
+# Starts the server, runs all three strategies, then shuts down.
+#
+# Usage (from repo root):
+#   ./scripts/demo-rest.sh
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+PORT=8080
+HOST="http://localhost:$PORT"
+SIGN=".demo/demo-signature-1280x720-rectangle.png"
+SEAL=".demo/demo-logo-1024x1024-square.png"
+
+# ── Shared tax info JSON (used by all three strategies) ───────────────────────
+read -r -d '' TAX_INFO_JSON <<'JSON' || true
+{
+  "documentDetails": { "bookNumber": "001", "documentNumber": "001" },
+  "payer": {
+    "taxId": "1234567890123",
+    "taxId10Digit": "1234567890",
+    "name": "บริษัท ตัวอย่าง จำกัด",
+    "address": "123 ถนนสุขุมวิท แขวงคลองตัน เขตวัฒนา กรุงเทพฯ 10110"
+  },
+  "payee": {
+    "taxId": "3210987654321",
+    "taxId10Digit": "1234567890",
+    "name": "นางสาวสมชาย นามสกุลยาวมากไหมนะก็ไม่รู้เหมือนกัน",
+    "address": "555 ต.ทุ่งนา  อ.ทุ่งนา  จ.ชลบุรี  12345",
+    "sequenceNumber": "321",
+    "pnd_1a": true,
+    "pnd_1aSpecial": true,
+    "pnd_2": true,
+    "pnd_2a": true,
+    "pnd_3": true,
+    "pnd_3a": true,
+    "pnd_53": true
+  },
+  "income40_1":     { "datePaid": "01 มกราคม 2568", "amountPaid": "401,010.01", "taxWithheld": "12,030.30" },
+  "income40_2":     { "datePaid": "02 ก.พ. 2568",   "amountPaid": "402,020.02", "taxWithheld": "12,060.60" },
+  "income40_3":     { "datePaid": "03 มี.ค. 2568",  "amountPaid": "403,030.03", "taxWithheld": "12,090.90" },
+  "income40_4A":    { "datePaid": "04 เม.ย. 2568",  "amountPaid": "404,040.04", "taxWithheld": "12,121.20" },
+  "income40_4B_1_1": { "datePaid": "05 พ.ค. 2568",  "amountPaid": "411,010.01", "taxWithheld": "12,330.30" },
+  "income40_4B_1_2": { "datePaid": "06 มิ.ย. 2568", "amountPaid": "412,020.02", "taxWithheld": "12,360.60" },
+  "income40_4B_1_3": { "datePaid": "07 ก.ค. 2568",  "amountPaid": "413,030.03", "taxWithheld": "12,390.90" },
+  "income40_4B_1_4_rate": "ร้อยละ 7",
+  "income40_4B_1_4": { "datePaid": "08 ส.ค. 2568",  "amountPaid": "414,040.04", "taxWithheld": "12,421.20" },
+  "income40_4B_2_1": { "datePaid": "09 ก.ย. 2568",  "amountPaid": "421,010.01", "taxWithheld": "12,630.30" },
+  "income40_4B_2_2": { "datePaid": "10 ต.ค. 2568",  "amountPaid": "422,020.02", "taxWithheld": "12,660.60" },
+  "income40_4B_2_3": { "datePaid": "11 พ.ย. 2568",  "amountPaid": "423,030.03", "taxWithheld": "12,690.90" },
+  "income40_4B_2_4": { "datePaid": "12 ธ.ค. 2568",  "amountPaid": "424,040.04", "taxWithheld": "12,721.20" },
+  "income40_4B_2_5_note": "กำไรอื่นๆ",
+  "income40_4B_2_5": { "datePaid": "13 ม.ค. 2568",  "amountPaid": "425,050.05", "taxWithheld": "12,751.50" },
+  "income5":        { "datePaid": "14 ก.พ. 2568",   "amountPaid": "500,010.01", "taxWithheld": "15,000.30" },
+  "income6_note":   "รายได้อื่นๆ",
+  "income6":        { "datePaid": "15 มี.ค. 2568",  "amountPaid": "600,060.06", "taxWithheld": "18,001.80" },
+  "totals": {
+    "totalAmountPaid": "5,741,320.36",
+    "totalTaxWithheld": "172,239.60",
+    "totalTaxWithheldInWords": "หนึ่งแสนเจ็ดหมื่นสองพันสองร้อยสามสิบเก้าบาทหกสิบสตางค์"
+  },
+  "otherPayments": {
+    "governmentPensionFund": "5,000.00",
+    "socialSecurityFund": "750.00",
+    "providentFund": "3,000.00"
+  },
+  "withholdingType": {
+    "withholdingTax": true,
+    "forever": true,
+    "oneTime": true,
+    "other": true,
+    "otherDetails": "อื่นๆ อื่นๆ อื่นๆ อื่นๆ"
+  },
+  "certification": { "dateOfIssuance": { "day": "22", "month": "ธันวาคม", "year": "2568" } }
+}
+JSON
+
+# ── Build release binary first ────────────────────────────────────────────────
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo " Building REST server ..."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+cargo build --bin rest --quiet
+
+# ── Start the server ──────────────────────────────────────────────────────────
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo " Starting REST server on port $PORT ..."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+PORT=$PORT ./target/debug/rest &>/tmp/pdf50tawi-rust-rest.log &
+SERVER_PID=$!
+trap 'echo ""; echo "Stopping server (PID $SERVER_PID)..."; kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; exit' EXIT
+
+# Wait until the server accepts connections
+MAX_WAIT=15
+ELAPSED=0
+until curl -sf "$HOST/" &>/dev/null || [[ $ELAPSED -ge $MAX_WAIT ]]; do
+  sleep 0.3
+  ELAPSED=$(( ELAPSED + 1 ))
+done
+sleep 0.5
+echo " Server ready."
+echo ""
+
+# ── Strategy A: multipart/form-data ──────────────────────────────────────────
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo " Strategy A — multipart/form-data"
+echo " POST $HOST/api/v1/taxes/multipart"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+curl -s -X POST "$HOST/api/v1/taxes/multipart" \
+  -F "taxInfo=$TAX_INFO_JSON" \
+  -F "signature=@$SIGN;type=image/png" \
+  -F "seal=@$SEAL;type=image/png" \
+  -o certificate-multipart.pdf \
+  -w "HTTP %{http_code} — %{size_download} bytes\n"
+
+echo " Output: certificate-multipart.pdf"
+echo ""
+
+# ── Strategy B: JSON body with base64-encoded images ─────────────────────────
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo " Strategy B — base64 images in JSON"
+echo " POST $HOST/api/v1/taxes/base64"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+BODY=$(python3 - <<PYEOF
+import json, base64
+
+with open("$SIGN", "rb") as f:
+    sign_b64 = base64.b64encode(f.read()).decode()
+
+with open("$SEAL", "rb") as f:
+    seal_b64 = base64.b64encode(f.read()).decode()
+
+tax_info = json.loads("""$TAX_INFO_JSON""")
+payload = {
+    "taxInfo": tax_info,
+    "signatureBase64": sign_b64,
+    "sealBase64": seal_b64,
+}
+print(json.dumps(payload))
+PYEOF
+)
+
+curl -s -X POST "$HOST/api/v1/taxes/base64" \
+  -H "Content-Type: application/json" \
+  -d "$BODY" \
+  -o certificate-base64.pdf \
+  -w "HTTP %{http_code} — %{size_download} bytes\n"
+
+echo " Output: certificate-base64.pdf"
+echo ""
+
+# ── Strategy C: JSON body with image URLs ─────────────────────────────────────
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo " Strategy C — image URLs (server fetches)"
+echo " POST $HOST/api/v1/taxes/url"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+FILE_SERVER_PORT=9090
+FILE_SERVER_ROOT=".demo"
+python3 -m http.server "$FILE_SERVER_PORT" --directory "$FILE_SERVER_ROOT" &>/dev/null &
+FILE_SERVER_PID=$!
+trap 'kill "$SERVER_PID" "$FILE_SERVER_PID" 2>/dev/null; wait 2>/dev/null' EXIT
+sleep 0.5
+
+SIGN_FILENAME=$(basename "$SIGN")
+SEAL_FILENAME=$(basename "$SEAL")
+SIGN_URL="http://localhost:$FILE_SERVER_PORT/$SIGN_FILENAME"
+SEAL_URL="http://localhost:$FILE_SERVER_PORT/$SEAL_FILENAME"
+
+BODY=$(python3 - <<PYEOF
+import json
+tax_info = json.loads("""$TAX_INFO_JSON""")
+payload = {
+    "taxInfo": tax_info,
+    "signatureURL": "$SIGN_URL",
+    "sealURL": "$SEAL_URL",
+}
+print(json.dumps(payload))
+PYEOF
+)
+
+curl -s -X POST "$HOST/api/v1/taxes/url" \
+  -H "Content-Type: application/json" \
+  -d "$BODY" \
+  -o certificate-url.pdf \
+  -w "HTTP %{http_code} — %{size_download} bytes\n"
+
+kill "$FILE_SERVER_PID" 2>/dev/null || true
+
+echo " Output: certificate-url.pdf"
+echo ""
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo " All three strategies completed successfully."
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

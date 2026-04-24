@@ -90,7 +90,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 
 PORT=$PORT ./target/debug/rest &>/tmp/pdf50tawi-rust-rest.log &
 SERVER_PID=$!
-trap 'echo ""; echo "Stopping server (PID $SERVER_PID)..."; kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; exit' EXIT
+trap 'echo ""; echo "Stopping server (PID $SERVER_PID)..."; kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; exit 0' EXIT
 
 # Wait until the server accepts connections
 MAX_WAIT=15

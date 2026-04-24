@@ -26,7 +26,7 @@ make demo-rest
 ```toml
 # Cargo.toml
 [dependencies]
-pdf50tawi = { git = "https://github.com/anuchito/pdf50tawi-rust" }
+pdf50tawi = { git = "https://github.com/AnuchitO/pdf50tawi-rust" }
 ```
 
 ```rust
@@ -235,7 +235,7 @@ pub struct TaxInfo {
 
 ## ไลบรารีที่เกี่ยวข้อง / Related
 
-- [pdf50tawi](https://github.com/anuchito/pdf50tawi) — Go version of this library
+- [pdf50tawi](https://github.com/AnuchitO/pdf50tawi) — Go version of this library
 
 ---
 

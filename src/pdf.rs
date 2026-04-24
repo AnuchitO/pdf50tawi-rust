@@ -123,11 +123,11 @@ impl GidEncoder {
         gid_char.sort_by_key(|&(g, _)| g);
 
         let mut buf: Vec<u8> = Vec::new();
-        write!(buf, "/CIDInit /ProcSet findresource begin\n").ok();
+        writeln!(buf, "/CIDInit /ProcSet findresource begin").ok();
         write!(buf, "12 dict begin\nbegincmap\n").ok();
-        write!(
+        writeln!(
             buf,
-            "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
+            "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def"
         )
         .ok();
         write!(buf, "/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n").ok();
@@ -138,16 +138,16 @@ impl GidEncoder {
         .ok();
 
         for chunk in gid_char.chunks(100) {
-            write!(buf, "{} beginbfchar\n", chunk.len()).ok();
+            writeln!(buf, "{} beginbfchar", chunk.len()).ok();
             for &(gid, c) in chunk {
                 let u16s: Vec<u16> = c.encode_utf16(&mut [0u16; 2]).to_vec();
                 if u16s.len() == 1 {
-                    write!(buf, "<{:04X}> <{:04X}>\n", gid, u16s[0]).ok();
+                    writeln!(buf, "<{:04X}> <{:04X}>", gid, u16s[0]).ok();
                 } else {
-                    write!(buf, "<{:04X}> <{:04X}{:04X}>\n", gid, u16s[0], u16s[1]).ok();
+                    writeln!(buf, "<{:04X}> <{:04X}{:04X}>", gid, u16s[0], u16s[1]).ok();
                 }
             }
-            write!(buf, "endbfchar\n").ok();
+            writeln!(buf, "endbfchar").ok();
         }
 
         write!(
@@ -348,8 +348,7 @@ fn deep_copy_object(
             id_map.insert(src_id, dst_id);
 
             let src_obj = src
-                .get_object(src_id)
-                .map(|o| o.clone())
+                .get_object(src_id).cloned()
                 .unwrap_or(Object::Null);
             let copied = deep_copy_object(src, dst, id_map, src_obj)?;
             dst.objects.insert(dst_id, copied);
@@ -607,13 +606,13 @@ fn write_checkmark_ops(buf: &mut Vec<u8>, x: f64, y_pdf_anchor: f64, size: f64) 
         ));
     }
 
-    write!(buf, "0 0 0 rg\n").ok();
+    writeln!(buf, "0 0 0 rg").ok();
     if let Some(&(fx, fy)) = poly.first() {
-        write!(buf, "{:.4} {:.4} m\n", x + fx, y_pdf_anchor + fy).ok();
+        writeln!(buf, "{:.4} {:.4} m", x + fx, y_pdf_anchor + fy).ok();
         for &(px, py) in poly.iter().skip(1) {
-            write!(buf, "{:.4} {:.4} l\n", x + px, y_pdf_anchor + py).ok();
+            writeln!(buf, "{:.4} {:.4} l", x + px, y_pdf_anchor + py).ok();
         }
-        write!(buf, "h f\n").ok();
+        writeln!(buf, "h f").ok();
     }
 }
 

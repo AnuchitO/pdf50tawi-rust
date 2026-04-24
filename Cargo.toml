@@ -1,5 +1,5 @@
 [package]
-name = "pdf_50_tawi_rust"
+name = "pdf50tawi"
 version = "0.1.0"
 edition = "2021"
 

@@ -9,7 +9,8 @@ use crate::template::template_bytes;
 pub const PAGE_WIDTH: f64 = 595.28;
 pub const PAGE_HEIGHT: f64 = 841.89;
 
-/// Converts anchor + offset to absolute PDF coordinates (origin = top-left, y-down).
+// ── Anchor coordinate system ──────────────────────────────────────────────────
+
 pub fn anchor_to_xy(anchor: Anchor, dx: f64, dy: f64) -> (f64, f64) {
     match anchor {
         Anchor::TopLeft     => (dx, -dy),
@@ -24,74 +25,184 @@ pub fn anchor_to_xy(anchor: Anchor, dx: f64, dy: f64) -> (f64, f64) {
     }
 }
 
-/// fill_certificate builds the output PDF:
-///   1. Import template page 1 as a Form XObject into a fresh document.
-///   2. Embed THSarabunNew TTF font.
-///   3. Render the XObject, then overlay text and images.
-///
-/// This mirrors the Go approach (gopdf + gofpdi) exactly: a clean new document
-/// with the template embedded as an XObject, so no existing resources are touched.
+// ── GID encoder ───────────────────────────────────────────────────────────────
+//
+// Identity-H encoding requires CID values to be glyph indices (GID), NOT
+// Unicode codepoints. This encoder parses the font's cmap table so every
+// character is mapped to its actual GID before being written into the PDF
+// content stream.
+
+struct GidEncoder {
+    char_to_gid: HashMap<char, u16>,
+    gid_to_width: HashMap<u16, u16>, // GID → advance width in font units
+    units_per_em: u16,
+}
+
+impl GidEncoder {
+    fn new(font_data: &[u8]) -> Result<Self> {
+        let face = ttf_parser::Face::parse(font_data, 0)
+            .map_err(|e| anyhow!("parse TTF: {:?}", e))?;
+        let units_per_em = face.units_per_em();
+
+        let mut char_to_gid: HashMap<char, u16> = HashMap::new();
+        let mut gid_to_width: HashMap<u16, u16> = HashMap::new();
+
+        // Collect all characters we might need: printable ASCII + Thai + common punctuation
+        let ranges: &[(u32, u32)] = &[
+            (0x0020, 0x007E), // printable ASCII
+            (0x00A0, 0x00FF), // Latin-1 supplement
+            (0x0E00, 0x0E7F), // Thai block
+            (0x2000, 0x206F), // General punctuation
+            (0x25A0, 0x25FF), // Geometric shapes (checkmarks etc)
+        ];
+
+        for &(start, end) in ranges {
+            for cp in start..=end {
+                if let Some(c) = char::from_u32(cp) {
+                    if let Some(gid) = face.glyph_index(c) {
+                        char_to_gid.insert(c, gid.0);
+                        if let Some(adv) = face.glyph_hor_advance(gid) {
+                            gid_to_width.insert(gid.0, adv);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Self { char_to_gid, gid_to_width, units_per_em })
+    }
+
+    /// Encode text as big-endian GID bytes for Identity-H / CIDFontType2.
+    fn encode(&self, text: &str) -> Vec<u8> {
+        let mut out = Vec::with_capacity(text.len() * 2);
+        for c in text.chars() {
+            let gid = self.char_to_gid.get(&c).copied().unwrap_or(0);
+            out.push((gid >> 8) as u8);
+            out.push((gid & 0xFF) as u8);
+        }
+        out
+    }
+
+    /// Exact text width in PDF points at the given font size.
+    fn text_width(&self, text: &str, font_size: f64) -> f64 {
+        let advance: u32 = text.chars()
+            .map(|c| {
+                let gid = self.char_to_gid.get(&c).copied().unwrap_or(0);
+                self.gid_to_width.get(&gid).copied().unwrap_or(500) as u32
+            })
+            .sum();
+        advance as f64 * font_size / self.units_per_em as f64
+    }
+
+    /// Build the PDF W (widths) array for the CIDFont dictionary.
+    /// Format: [ gid [width_in_glyph_units] ... ]
+    fn w_array(&self) -> Vec<Object> {
+        let scale = 1000.0 / self.units_per_em as f64;
+        let mut pairs: Vec<(u16, u16)> = self.gid_to_width.iter()
+            .map(|(&g, &w)| (g, w))
+            .collect();
+        pairs.sort_by_key(|&(g, _)| g);
+
+        let mut arr = Vec::with_capacity(pairs.len() * 2);
+        for (gid, adv) in pairs {
+            arr.push(Object::Integer(gid as i64));
+            arr.push(Object::Array(vec![Object::Integer((adv as f64 * scale).round() as i64)]));
+        }
+        arr
+    }
+
+    /// Build a proper ToUnicode CMap: GID → Unicode character.
+    fn to_unicode_cmap(&self) -> Vec<u8> {
+        let mut gid_char: Vec<(u16, char)> = self.char_to_gid.iter()
+            .map(|(&c, &g)| (g, c))
+            .collect();
+        gid_char.sort_by_key(|&(g, _)| g);
+
+        let mut buf: Vec<u8> = Vec::new();
+        write!(buf, "/CIDInit /ProcSet findresource begin\n").ok();
+        write!(buf, "12 dict begin\nbegincmap\n").ok();
+        write!(buf, "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n").ok();
+        write!(buf, "/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n").ok();
+        write!(buf, "1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n").ok();
+
+        for chunk in gid_char.chunks(100) {
+            write!(buf, "{} beginbfchar\n", chunk.len()).ok();
+            for &(gid, c) in chunk {
+                let u16s: Vec<u16> = c.encode_utf16(&mut [0u16; 2]).to_vec();
+                if u16s.len() == 1 {
+                    write!(buf, "<{:04X}> <{:04X}>\n", gid, u16s[0]).ok();
+                } else {
+                    write!(buf, "<{:04X}> <{:04X}{:04X}>\n", gid, u16s[0], u16s[1]).ok();
+                }
+            }
+            write!(buf, "endbfchar\n").ok();
+        }
+
+        write!(buf, "endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n").ok();
+        buf
+    }
+}
+
+// ── Main entry point ──────────────────────────────────────────────────────────
+
 pub fn fill_certificate<W: io::Write>(
     text_fields: Vec<TextField>,
     image_fields: Vec<ImageField>,
     out: &mut W,
 ) -> Result<()> {
-    // ── 1. Load template and import page 1 as Form XObject ───────────────────
+    // Build GID encoder from the embedded font
+    let encoder = GidEncoder::new(TH_SARABUN_FONT_DATA)
+        .context("build GID encoder")?;
+
+    // Load template and import page 1 as Form XObject into a fresh document
     let tpl_bytes = template_bytes();
     let mut tpl_doc = Document::load_from(Cursor::new(tpl_bytes))
         .context("load template PDF")?;
-    tpl_doc.decompress();  // ensure all streams are in raw (uncompressed) state
+    tpl_doc.decompress();
 
     let mut doc = Document::with_version("1.7");
-
-    // id_map: tpl object id → new doc object id (to break reference cycles)
     let mut id_map: HashMap<lopdf::ObjectId, lopdf::ObjectId> = HashMap::new();
 
     let (xobj_id, media_box) = import_page_as_xobject(&tpl_doc, &mut doc, &mut id_map)
         .context("import template page")?;
 
-    // ── 2. Add Thai TTF font ──────────────────────────────────────────────────
-    let (font_id, font_name) = add_ttf_font(&mut doc)?;
+    // Embed Thai font with proper GID-based encoding
+    let (font_id, font_name) = add_ttf_font(&mut doc, &encoder)?;
 
-    // ── 3. Build content stream ───────────────────────────────────────────────
+    // Build content stream
     let mut content: Vec<u8> = Vec::new();
+    write!(content, "q\n/TplPage Do\nQ\n").ok(); // render template as background
 
-    // Render template as background
-    write!(content, "q\n/TplPage Do\nQ\n").ok();
-
-    // Background images (on_top = false)
+    // Background images
     let mut img_xobjs: Vec<(String, lopdf::ObjectId)> = Vec::new();
     for img_field in &image_fields {
         if !img_field.on_top {
-            if let Some((name, id)) = write_image_ops(&mut doc, &mut content, img_field) {
-                img_xobjs.push((name, id));
+            if let Some(pair) = write_image_ops(&mut doc, &mut content, img_field) {
+                img_xobjs.push(pair);
             }
         }
     }
 
-    // Text overlay
-    write_text_ops(&mut content, &text_fields, &font_name);
+    write_text_ops(&mut content, &text_fields, &font_name, &encoder);
 
-    // Foreground images (on_top = true)
+    // Foreground images
     for img_field in &image_fields {
         if img_field.on_top {
-            if let Some((name, id)) = write_image_ops(&mut doc, &mut content, img_field) {
-                img_xobjs.push((name, id));
+            if let Some(pair) = write_image_ops(&mut doc, &mut content, img_field) {
+                img_xobjs.push(pair);
             }
         }
     }
 
-    // ── 4. Assemble page ──────────────────────────────────────────────────────
+    // Assemble page
     let content_id = doc.add_object(Stream::new(Dictionary::new(), content));
 
-    // XObject resources: template + images
     let mut xobjects = Dictionary::new();
     xobjects.set(b"TplPage".to_vec(), Object::Reference(xobj_id));
     for (name, id) in img_xobjs {
         xobjects.set(name.into_bytes(), Object::Reference(id));
     }
 
-    // Font resources
     let mut fonts = Dictionary::new();
     fonts.set(font_name.as_bytes(), Object::Reference(font_id));
 
@@ -104,40 +215,32 @@ pub fn fill_certificate<W: io::Write>(
     page_dict.set(b"MediaBox".to_vec(),  media_box);
     page_dict.set(b"Resources".to_vec(), Object::Dictionary(resources));
     page_dict.set(b"Contents".to_vec(),  Object::Reference(content_id));
-
     let page_id = doc.add_object(Object::Dictionary(page_dict));
 
-    // Pages node
     let mut pages_dict = Dictionary::new();
     pages_dict.set(b"Type".to_vec(),  Object::Name(b"Pages".to_vec()));
     pages_dict.set(b"Count".to_vec(), Object::Integer(1));
     pages_dict.set(b"Kids".to_vec(),  Object::Array(vec![Object::Reference(page_id)]));
     let pages_id = doc.add_object(Object::Dictionary(pages_dict));
 
-    // Back-fill Parent on page
     if let Ok(Object::Dictionary(d)) = doc.get_object_mut(page_id) {
         d.set(b"Parent".to_vec(), Object::Reference(pages_id));
     }
 
-    // Catalog
     let mut catalog = Dictionary::new();
     catalog.set(b"Type".to_vec(),  Object::Name(b"Catalog".to_vec()));
     catalog.set(b"Pages".to_vec(), Object::Reference(pages_id));
     let catalog_id = doc.add_object(Object::Dictionary(catalog));
-
     doc.trailer.set(b"Root".to_vec(), Object::Reference(catalog_id));
 
-    // ── 5. Write output ───────────────────────────────────────────────────────
     let mut buf = Vec::new();
     doc.save_to(&mut buf).context("save PDF")?;
     out.write_all(&buf).context("write output")?;
     Ok(())
 }
 
-// ── Template import ───────────────────────────────────────────────────────────
+// ── Template import (Form XObject) ────────────────────────────────────────────
 
-/// Import page 1 of tpl_doc into doc as a Form XObject.
-/// Returns (xobj_id, MediaBox).
 fn import_page_as_xobject(
     tpl_doc: &Document,
     doc: &mut Document,
@@ -146,39 +249,30 @@ fn import_page_as_xobject(
     let pages = tpl_doc.get_pages();
     let page_id = *pages.get(&1).ok_or_else(|| anyhow!("template has no page 1"))?;
 
-    let page_dict = tpl_doc.get_object(page_id)
-        .context("get template page")?
-        .as_dict()
-        .context("page is not a dict")?
-        .clone();
+    let page_dict = tpl_doc.get_object(page_id)?
+        .as_dict().context("page not a dict")?.clone();
 
-    // Resolve inherited MediaBox
     let media_box = page_dict.get(b"MediaBox")
         .or_else(|_| page_dict.get(b"CropBox"))
-        .context("no MediaBox in template")?
-        .clone();
+        .context("no MediaBox")?.clone();
 
-    // Deep-copy Resources from tpl_doc → doc
     let resources_obj = match page_dict.get(b"Resources") {
         Ok(r) => deep_copy_object(tpl_doc, doc, id_map, r.clone())?,
         Err(_) => Object::Dictionary(Dictionary::new()),
     };
 
-    // Collect and concatenate all content streams (already decompressed by tpl_doc.decompress())
     let content_bytes = collect_content_streams(tpl_doc, &page_dict)?;
 
-    // Build Form XObject
     let mut xobj_dict = Dictionary::new();
-    xobj_dict.set(b"Type".to_vec(),    Object::Name(b"XObject".to_vec()));
-    xobj_dict.set(b"Subtype".to_vec(), Object::Name(b"Form".to_vec()));
-    xobj_dict.set(b"BBox".to_vec(),    media_box.clone());
+    xobj_dict.set(b"Type".to_vec(),      Object::Name(b"XObject".to_vec()));
+    xobj_dict.set(b"Subtype".to_vec(),   Object::Name(b"Form".to_vec()));
+    xobj_dict.set(b"BBox".to_vec(),      media_box.clone());
     xobj_dict.set(b"Resources".to_vec(), resources_obj);
 
     let xobj_id = doc.add_object(Stream::new(xobj_dict, content_bytes));
     Ok((xobj_id, media_box))
 }
 
-/// Collect and concatenate all content stream bytes for a page.
 fn collect_content_streams(doc: &Document, page_dict: &Dictionary) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let contents = match page_dict.get(b"Contents") {
@@ -198,18 +292,13 @@ fn collect_content_streams(doc: &Document, page_dict: &Dictionary) -> Result<Vec
         if let Ok(obj) = doc.get_object(id) {
             if let Ok(stream) = obj.as_stream() {
                 out.extend_from_slice(&stream.content);
-                // ensure streams are separated by whitespace
-                if out.last() != Some(&b'\n') {
-                    out.push(b'\n');
-                }
+                if out.last() != Some(&b'\n') { out.push(b'\n'); }
             }
         }
     }
     Ok(out)
 }
 
-/// Recursively deep-copy a PDF object from tpl_doc into doc, remapping all
-/// indirect references via id_map to avoid duplication and cycles.
 fn deep_copy_object(
     src: &Document,
     dst: &mut Document,
@@ -218,29 +307,21 @@ fn deep_copy_object(
 ) -> Result<Object> {
     match obj {
         Object::Reference(src_id) => {
-            // Already mapped?
             if let Some(&dst_id) = id_map.get(&src_id) {
                 return Ok(Object::Reference(dst_id));
             }
-            // Reserve a new ID first (breaks cycles)
             let dst_id = dst.add_object(Object::Null);
             id_map.insert(src_id, dst_id);
 
-            // Fetch and copy the referenced object
-            let src_obj = match src.get_object(src_id) {
-                Ok(o) => o.clone(),
-                Err(_) => Object::Null,
-            };
+            let src_obj = src.get_object(src_id).map(|o| o.clone()).unwrap_or(Object::Null);
             let copied = deep_copy_object(src, dst, id_map, src_obj)?;
-            // Replace the placeholder
             dst.objects.insert(dst_id, copied);
             Ok(Object::Reference(dst_id))
         }
         Object::Dictionary(dict) => {
             let mut new_dict = Dictionary::new();
             for (k, v) in dict.iter() {
-                let new_v = deep_copy_object(src, dst, id_map, v.clone())?;
-                new_dict.set(k.clone(), new_v);
+                new_dict.set(k.clone(), deep_copy_object(src, dst, id_map, v.clone())?);
             }
             Ok(Object::Dictionary(new_dict))
         }
@@ -254,10 +335,8 @@ fn deep_copy_object(
         Object::Stream(s) => {
             let mut new_dict = Dictionary::new();
             for (k, v) in s.dict.iter() {
-                // Skip Filter/Length — content is already raw after decompress()
                 if k == b"Filter" || k == b"DecodeParms" { continue; }
-                let new_v = deep_copy_object(src, dst, id_map, v.clone())?;
-                new_dict.set(k.clone(), new_v);
+                new_dict.set(k.clone(), deep_copy_object(src, dst, id_map, v.clone())?);
             }
             Ok(Object::Stream(Stream::new(new_dict, s.content.clone())))
         }
@@ -267,20 +346,17 @@ fn deep_copy_object(
 
 // ── Font embedding ────────────────────────────────────────────────────────────
 
-/// Embed THSarabunNew as a Type0/Identity-H font. Returns (font object id, resource name).
-fn add_ttf_font(doc: &mut Document) -> Result<(lopdf::ObjectId, String)> {
+fn add_ttf_font(doc: &mut Document, encoder: &GidEncoder) -> Result<(lopdf::ObjectId, String)> {
     let font_res_name = "ThSrbn";
     let font_data = TH_SARABUN_FONT_DATA;
     let compressed = compress_zlib(font_data);
 
-    // FontFile2
     let mut fs_dict = Dictionary::new();
     fs_dict.set(b"Length".to_vec(),  Object::Integer(compressed.len() as i64));
     fs_dict.set(b"Length1".to_vec(), Object::Integer(font_data.len() as i64));
     fs_dict.set(b"Filter".to_vec(),  Object::Name(b"FlateDecode".to_vec()));
     let ff_id = doc.add_object(Stream::new(fs_dict, compressed));
 
-    // FontDescriptor
     let mut desc = Dictionary::new();
     desc.set(b"Type".to_vec(),      Object::Name(b"FontDescriptor".to_vec()));
     desc.set(b"FontName".to_vec(),  Object::Name(b"THSarabunNew".to_vec()));
@@ -297,7 +373,7 @@ fn add_ttf_font(doc: &mut Document) -> Result<(lopdf::ObjectId, String)> {
     desc.set(b"FontFile2".to_vec(), Object::Reference(ff_id));
     let desc_id = doc.add_object(Object::Dictionary(desc));
 
-    // CIDFont (Type2)
+    // CIDFont with proper W (widths) array built from actual font metrics
     let mut cid = Dictionary::new();
     cid.set(b"Type".to_vec(),    Object::Name(b"Font".to_vec()));
     cid.set(b"Subtype".to_vec(), Object::Name(b"CIDFontType2".to_vec()));
@@ -311,20 +387,15 @@ fn add_ttf_font(doc: &mut Document) -> Result<(lopdf::ObjectId, String)> {
     }));
     cid.set(b"FontDescriptor".to_vec(), Object::Reference(desc_id));
     cid.set(b"DW".to_vec(), Object::Integer(1000));
+    cid.set(b"W".to_vec(),  Object::Array(encoder.w_array())); // exact per-glyph widths
     let cid_id = doc.add_object(Object::Dictionary(cid));
 
-    // ToUnicode CMap
-    let cmap: &[u8] = b"/CIDInit /ProcSet findresource begin\n\
-        12 dict begin\nbegincmap\n\
-        /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
-        /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
-        1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
-        endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n";
+    // Proper ToUnicode CMap (GID → Unicode)
+    let cmap_bytes = encoder.to_unicode_cmap();
     let mut cmap_dict = Dictionary::new();
-    cmap_dict.set(b"Length".to_vec(), Object::Integer(cmap.len() as i64));
-    let cmap_id = doc.add_object(Stream::new(cmap_dict, cmap.to_vec()));
+    cmap_dict.set(b"Length".to_vec(), Object::Integer(cmap_bytes.len() as i64));
+    let cmap_id = doc.add_object(Stream::new(cmap_dict, cmap_bytes));
 
-    // Type0
     let mut font = Dictionary::new();
     font.set(b"Type".to_vec(),            Object::Name(b"Font".to_vec()));
     font.set(b"Subtype".to_vec(),         Object::Name(b"Type0".to_vec()));
@@ -339,37 +410,29 @@ fn add_ttf_font(doc: &mut Document) -> Result<(lopdf::ObjectId, String)> {
 
 // ── Text placement ────────────────────────────────────────────────────────────
 
-fn write_text_ops(buf: &mut Vec<u8>, fields: &[TextField], font_name: &str) {
+fn write_text_ops(buf: &mut Vec<u8>, fields: &[TextField], font_name: &str, enc: &GidEncoder) {
     for field in fields {
         if field.text == "✓" {
             let (x, y_td) = anchor_to_xy(field.position, field.dx, field.dy);
-            let y_pdf = PAGE_HEIGHT - y_td;
-            write_checkmark_ops(buf, x, y_pdf, field.font_size as f64);
+            write_checkmark_ops(buf, x, PAGE_HEIGHT - y_td, field.font_size as f64);
         } else {
             let (x, y_td) = anchor_to_xy(field.position, field.dx, field.dy);
             let fs = field.font_size as f64;
             let y_pdf = PAGE_HEIGHT - y_td - fs * 0.75;
 
-            // UTF-16BE for Identity-H / Type0
-            let utf16: Vec<u16> = field.text.encode_utf16().collect();
-            let mut encoded = Vec::with_capacity(utf16.len() * 2);
-            for code in &utf16 {
-                encoded.push((code >> 8) as u8);
-                encoded.push((code & 0xFF) as u8);
-            }
-
-            // Approximate width for alignment
-            let char_count = field.text.chars().count() as f64;
-            let approx_w = fs * 0.55 * char_count;
+            // Use exact GID-based text width for alignment
+            let text_w = enc.text_width(&field.text, fs);
             let x_adj = match field.position {
-                Anchor::TopCenter | Anchor::BottomCenter | Anchor::Center => x - approx_w / 2.0,
-                Anchor::TopRight  | Anchor::BottomRight  | Anchor::Right  => x - approx_w,
+                Anchor::TopCenter | Anchor::BottomCenter | Anchor::Center => x - text_w / 2.0,
+                Anchor::TopRight  | Anchor::BottomRight  | Anchor::Right  => x - text_w,
                 _ => x,
             };
 
-            write!(buf, "BT\n/{} {} Tf\n{:.4} {:.4} Td\n<",
-                   font_name, field.font_size, x_adj, y_pdf).ok();
-            for byte in &encoded { write!(buf, "{:02X}", byte).ok(); }
+            // Encode with actual GIDs (not raw Unicode codepoints)
+            let gid_bytes = enc.encode(&field.text);
+
+            write!(buf, "BT\n/{} {} Tf\n{:.4} {:.4} Td\n<", font_name, field.font_size, x_adj, y_pdf).ok();
+            for byte in &gid_bytes { write!(buf, "{:02X}", byte).ok(); }
             write!(buf, "> Tj\nET\n").ok();
         }
     }
@@ -377,94 +440,78 @@ fn write_text_ops(buf: &mut Vec<u8>, fields: &[TextField], font_name: &str) {
 
 // ── Checkmark ─────────────────────────────────────────────────────────────────
 
-/// Exact port of Go's drawCheckmark: bold vector polygon, 28-sample arms, 16-step caps.
 fn write_checkmark_ops(buf: &mut Vec<u8>, x: f64, y_pdf_anchor: f64, size: f64) {
     const N: usize = 28;
     const C: usize = 16;
-
     let h = size * 0.125;
 
-    // Geometry in PDF-relative coords (x right, y up from anchor)
-    let p0rx = 0.10 * size; let p0ry = -0.42 * size;
-    let p1rx = 0.27 * size; let p1ry = -0.77 * size;
-    let c1rx = 0.44 * size; let c1ry = -0.83 * size;
-    let c2rx = 0.80 * size; let c2ry = -0.23 * size;
-    let p2rx = 0.97 * size; let p2ry = -0.07 * size;
+    let p0rx = 0.10*size; let p0ry = -0.42*size;
+    let p1rx = 0.27*size; let p1ry = -0.77*size;
+    let c1rx = 0.44*size; let c1ry = -0.83*size;
+    let c2rx = 0.80*size; let c2ry = -0.23*size;
+    let p2rx = 0.97*size; let p2ry = -0.07*size;
 
-    let ldx = p1rx - p0rx; let ldy = p1ry - p0ry;
-    let ll = (ldx*ldx + ldy*ldy).sqrt();
-    let (ldx, ldy) = (ldx/ll, ldy/ll);
-    let (lox, loy) = (-ldy, ldx);
-    let (lix, liy) = (ldy, -ldx);
-    let (lbx, lby) = (-ldx, -ldy);
+    let ldx=p1rx-p0rx; let ldy=p1ry-p0ry;
+    let ll=(ldx*ldx+ldy*ldy).sqrt();
+    let (ldx,ldy)=(ldx/ll,ldy/ll);
+    let (lox,loy)=(-ldy,ldx);
+    let (lix,liy)=(ldy,-ldx);
+    let (lbx,lby)=(-ldx,-ldy);
 
-    let rtdx = p2rx - c2rx; let rtdy = p2ry - c2ry;
-    let rl = (rtdx*rtdx + rtdy*rtdy).sqrt();
-    let (rtdx, rtdy) = (rtdx/rl, rtdy/rl);
-    let (rox, roy) = (-rtdy, rtdx);
+    let rtdx=p2rx-c2rx; let rtdy=p2ry-c2ry;
+    let rl=(rtdx*rtdx+rtdy*rtdy).sqrt();
+    let (rtdx,rtdy)=(rtdx/rl,rtdy/rl);
+    let (rox,roy)=(-rtdy,rtdx);
 
-    let rvtdx = c1rx - p1rx; let rvtdy = c1ry - p1ry;
-    let rvl = (rvtdx*rvtdx + rvtdy*rvtdy).sqrt();
-    let (rvtdx, rvtdy) = (rvtdx/rvl, rvtdy/rvl);
+    let rvtdx=c1rx-p1rx; let rvtdy=c1ry-p1ry;
+    let rvl=(rvtdx*rvtdx+rvtdy*rvtdy).sqrt();
+    let (rvtdx,rvtdy)=(rvtdx/rvl,rvtdy/rvl);
 
-    let bez_oi = |t: f64, hh: f64| -> ((f64,f64),(f64,f64)) {
-        let u = 1.0 - t;
-        let px = u*u*u*p1rx + 3.0*u*u*t*c1rx + 3.0*u*t*t*c2rx + t*t*t*p2rx;
-        let py = u*u*u*p1ry + 3.0*u*u*t*c1ry + 3.0*u*t*t*c2ry + t*t*t*p2ry;
-        let tdx = 3.0*(u*u*(c1rx-p1rx) + 2.0*u*t*(c2rx-c1rx) + t*t*(p2rx-c2rx));
-        let tdy = 3.0*(u*u*(c1ry-p1ry) + 2.0*u*t*(c2ry-c1ry) + t*t*(p2ry-c2ry));
-        let tl = (tdx*tdx + tdy*tdy).sqrt();
-        let (tdx, tdy) = (tdx/tl, tdy/tl);
-        ((px - tdy*hh, py + tdx*hh), (px + tdy*hh, py - tdx*hh))
+    let bez_oi=|t:f64,hh:f64|->((f64,f64),(f64,f64)){
+        let u=1.0-t;
+        let px=u*u*u*p1rx+3.0*u*u*t*c1rx+3.0*u*t*t*c2rx+t*t*t*p2rx;
+        let py=u*u*u*p1ry+3.0*u*u*t*c1ry+3.0*u*t*t*c2ry+t*t*t*p2ry;
+        let tdx=3.0*(u*u*(c1rx-p1rx)+2.0*u*t*(c2rx-c1rx)+t*t*(p2rx-c2rx));
+        let tdy=3.0*(u*u*(c1ry-p1ry)+2.0*u*t*(c2ry-c1ry)+t*t*(p2ry-c2ry));
+        let tl=(tdx*tdx+tdy*tdy).sqrt();
+        let (tdx,tdy)=(tdx/tl,tdy/tl);
+        ((px-tdy*hh,py+tdx*hh),(px+tdy*hh,py-tdx*hh))
     };
 
-    let mut poly: Vec<(f64,f64)> = Vec::with_capacity(2*N + 2*C + 40);
+    let mut poly:Vec<(f64,f64)>=Vec::with_capacity(2*N+2*C+40);
 
-    for i in 0..=N {
-        let t = i as f64 / N as f64;
-        poly.push((p0rx + t*(p1rx-p0rx) + lox*h, p0ry + t*(p1ry-p0ry) + loy*h));
-    }
-    poly.push((p1rx, p1ry - h));
-    for i in 1..=N { let (o,_) = bez_oi(i as f64/N as f64, h); poly.push(o); }
-    for i in 0..=C {
-        let θ = std::f64::consts::PI * i as f64 / C as f64;
-        let (c, s) = (θ.cos(), θ.sin());
-        poly.push((p2rx + (c*rox + s*rtdx)*h, p2ry + (c*roy + s*rtdy)*h));
-    }
-    for i in (1..N).rev() { let (_,pi) = bez_oi(i as f64/N as f64, h); poly.push(pi); }
+    for i in 0..=N { let t=i as f64/N as f64;
+        poly.push((p0rx+t*(p1rx-p0rx)+lox*h, p0ry+t*(p1ry-p0ry)+loy*h)); }
+    poly.push((p1rx, p1ry-h));
+    for i in 1..=N { let (o,_)=bez_oi(i as f64/N as f64,h); poly.push(o); }
+    for i in 0..=C { let a=std::f64::consts::PI*i as f64/C as f64;
+        let (c,s)=(a.cos(),a.sin());
+        poly.push((p2rx+(c*rox+s*rtdx)*h, p2ry+(c*roy+s*rtdy)*h)); }
+    for i in (1..N).rev() { let (_,pi)=bez_oi(i as f64/N as f64,h); poly.push(pi); }
 
-    let riv_x = p1rx + rvtdy*h; let riv_y = p1ry - rvtdx*h;
-    let liv_x = p1rx + lix*h;   let liv_y = p1ry + liy*h;
-    let ct_x  = (riv_x + liv_x) * 0.5;
-    let ct_y  = p1ry - h * 0.6;
-    for i in 0..=8 {
-        let t = i as f64/8.0; let u = 1.0-t;
-        poly.push((u*u*riv_x + 2.0*u*t*ct_x + t*t*liv_x,
-                   u*u*riv_y + 2.0*u*t*ct_y + t*t*liv_y));
-    }
-    for i in (0..N).rev() {
-        let t = i as f64/N as f64;
-        poly.push((p0rx + t*(p1rx-p0rx) + lix*h, p0ry + t*(p1ry-p0ry) + liy*h));
-    }
-    for i in 0..=C {
-        let θ = std::f64::consts::PI * i as f64 / C as f64;
-        let (c, s) = (θ.cos(), θ.sin());
-        poly.push((p0rx + (c*lix + s*lbx)*h, p0ry + (c*liy + s*lby)*h));
-    }
+    let riv_x=p1rx+rvtdy*h; let riv_y=p1ry-rvtdx*h;
+    let liv_x=p1rx+lix*h;   let liv_y=p1ry+liy*h;
+    let ct_x=(riv_x+liv_x)*0.5; let ct_y=p1ry-h*0.6;
+    for i in 0..=8 { let t=i as f64/8.0; let u=1.0-t;
+        poly.push((u*u*riv_x+2.0*u*t*ct_x+t*t*liv_x,
+                   u*u*riv_y+2.0*u*t*ct_y+t*t*liv_y)); }
+    for i in (0..N).rev() { let t=i as f64/N as f64;
+        poly.push((p0rx+t*(p1rx-p0rx)+lix*h, p0ry+t*(p1ry-p0ry)+liy*h)); }
+    for i in 0..=C { let a=std::f64::consts::PI*i as f64/C as f64;
+        let (c,s)=(a.cos(),a.sin());
+        poly.push((p0rx+(c*lix+s*lbx)*h, p0ry+(c*liy+s*lby)*h)); }
 
-    write!(buf, "0 0 0 rg\n").ok();
-    if let Some(&(fx, fy)) = poly.first() {
-        write!(buf, "{:.4} {:.4} m\n", x+fx, y_pdf_anchor+fy).ok();
-        for &(px, py) in poly.iter().skip(1) {
-            write!(buf, "{:.4} {:.4} l\n", x+px, y_pdf_anchor+py).ok();
-        }
-        write!(buf, "h f\n").ok();
+    write!(buf,"0 0 0 rg\n").ok();
+    if let Some(&(fx,fy))=poly.first() {
+        write!(buf,"{:.4} {:.4} m\n",x+fx,y_pdf_anchor+fy).ok();
+        for &(px,py) in poly.iter().skip(1) {
+            write!(buf,"{:.4} {:.4} l\n",x+px,y_pdf_anchor+py).ok(); }
+        write!(buf,"h f\n").ok();
     }
 }
 
 // ── Image placement ───────────────────────────────────────────────────────────
 
-/// Encode image as XObject and emit draw ops. Returns (resource name, object id) or None.
 fn write_image_ops(
     doc: &mut Document,
     buf: &mut Vec<u8>,
@@ -489,7 +536,6 @@ fn write_image_ops(
     let c_rgb   = compress_zlib(&rgb);
     let c_alpha = compress_zlib(&alpha);
 
-    // SMask
     let mut sm = Dictionary::new();
     sm.set(b"Type".to_vec(),             Object::Name(b"XObject".to_vec()));
     sm.set(b"Subtype".to_vec(),          Object::Name(b"Image".to_vec()));
@@ -501,7 +547,6 @@ fn write_image_ops(
     sm.set(b"Length".to_vec(),           Object::Integer(c_alpha.len() as i64));
     let smask_id = doc.add_object(Stream::new(sm, c_alpha));
 
-    // Image XObject
     let xobj_name = format!("Img{}", doc.objects.len());
     let mut im = Dictionary::new();
     im.set(b"Type".to_vec(),             Object::Name(b"XObject".to_vec()));
@@ -515,7 +560,6 @@ fn write_image_ops(
     im.set(b"SMask".to_vec(),            Object::Reference(smask_id));
     let img_id = doc.add_object(Stream::new(im, c_rgb));
 
-    // Emit draw operator
     write!(buf, "q\n{:.4} 0 0 {:.4} {:.4} {:.4} cm\n/{} Do\nQ\n",
            disp_w, disp_h, x, y_pdf, xobj_name).ok();
 

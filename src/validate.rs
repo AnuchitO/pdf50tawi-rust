@@ -1,29 +1,25 @@
-use crate::tax_info::{TaxInfo, Payee, WithholdingType};
+use crate::tax_info::{Payee, TaxInfo, WithholdingType};
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Default, Error)]
 #[error("{}", errors.join("; "))]
 pub struct ValidationError {
     pub errors: Vec<String>,
 }
 
 impl ValidationError {
-    pub fn new() -> Self {
-        Self { errors: Vec::new() }
-    }
-
-    pub fn add(&mut self, msg: impl Into<String>) {
+    fn add(&mut self, msg: impl Into<String>) {
         self.errors.push(msg.into());
     }
 
-    pub fn has_errors(&self) -> bool {
+    fn has_errors(&self) -> bool {
         !self.errors.is_empty()
     }
 }
 
-/// ValidateTaxInfo validates all fields in TaxInfo and returns a comprehensive error if any.
+/// Validates all fields in [`TaxInfo`] and returns a combined error if any fail.
 pub fn validate_tax_info(t: &TaxInfo) -> Result<(), ValidationError> {
-    let mut ve = ValidationError::new();
+    let mut ve = ValidationError::default();
 
     validate_party(&mut ve, "payer", &t.payer.name, &t.payer.tax_id, &t.payer.tax_id10_digit);
     validate_party(&mut ve, "payee", &t.payee.name, &t.payee.tax_id, &t.payee.tax_id10_digit);
@@ -72,7 +68,7 @@ mod tests {
     use super::*;
     use crate::tax_info::*;
 
-    fn minimal_tax_info() -> TaxInfo {
+    fn minimal() -> TaxInfo {
         let mut t = TaxInfo::default();
         t.payer.name = "Test Payer".to_string();
         t.payee.name = "Test Payee".to_string();
@@ -82,40 +78,99 @@ mod tests {
     }
 
     #[test]
-    fn test_valid_tax_info() {
-        let t = minimal_tax_info();
-        assert!(validate_tax_info(&t).is_ok());
+    fn valid_minimal_passes() {
+        assert!(validate_tax_info(&minimal()).is_ok());
     }
 
     #[test]
-    fn test_missing_payer_name() {
-        let mut t = minimal_tax_info();
-        t.payer.name = "".to_string();
+    fn empty_payer_name_is_rejected() {
+        let mut t = minimal();
+        t.payer.name = String::new();
         let err = validate_tax_info(&t).unwrap_err();
         assert!(err.errors.iter().any(|e| e.contains("payer.name is required")));
     }
 
     #[test]
-    fn test_invalid_tax_id() {
-        let mut t = minimal_tax_info();
-        t.payer.tax_id = "123".to_string(); // Too short
+    fn whitespace_only_name_is_rejected() {
+        let mut t = minimal();
+        t.payer.name = "   ".to_string();
+        let err = validate_tax_info(&t).unwrap_err();
+        assert!(err.errors.iter().any(|e| e.contains("payer.name is required")));
+    }
+
+    #[test]
+    fn short_tax_id_is_rejected() {
+        let mut t = minimal();
+        t.payer.tax_id = "123".to_string();
         let err = validate_tax_info(&t).unwrap_err();
         assert!(err.errors.iter().any(|e| e.contains("payer.taxId must be 13 digits")));
     }
 
     #[test]
-    fn test_no_pnd_selected() {
-        let mut t = minimal_tax_info();
-        t.payee.pnd_1a = false;
-        let err = validate_tax_info(&t).unwrap_err();
-        assert!(!err.errors.is_empty());
+    fn tax_id_with_spaces_is_accepted() {
+        let mut t = minimal();
+        t.payer.tax_id = "1 234 5678 9012 3".to_string(); // 13 digits with spaces
+        assert!(validate_tax_info(&t).is_ok());
     }
 
     #[test]
-    fn test_no_withholding_type() {
-        let mut t = minimal_tax_info();
-        t.withholding_type.withholding_tax = false;
+    fn invalid_10digit_tax_id_is_rejected() {
+        let mut t = minimal();
+        t.payer.tax_id10_digit = "12345".to_string();
         let err = validate_tax_info(&t).unwrap_err();
-        assert!(!err.errors.is_empty());
+        assert!(err.errors.iter().any(|e| e.contains("payer.taxId10Digit must be 10 digits")));
+    }
+
+    #[test]
+    fn no_pnd_selected_is_rejected() {
+        let mut t = minimal();
+        t.payee.pnd_1a = false;
+        assert!(validate_tax_info(&t).is_err());
+    }
+
+    #[test]
+    fn any_pnd_type_is_sufficient() {
+        for (i, pnd) in ["pnd_1a", "pnd_1a_special", "pnd_2", "pnd_3", "pnd_2a", "pnd_3a", "pnd_53"].iter().enumerate() {
+            let mut t = minimal();
+            t.payee.pnd_1a = false;
+            match i {
+                0 => t.payee.pnd_1a = true,
+                1 => t.payee.pnd_1a_special = true,
+                2 => t.payee.pnd_2 = true,
+                3 => t.payee.pnd_3 = true,
+                4 => t.payee.pnd_2a = true,
+                5 => t.payee.pnd_3a = true,
+                6 => t.payee.pnd_53 = true,
+                _ => unreachable!(),
+            }
+            assert!(validate_tax_info(&t).is_ok(), "{} should be valid", pnd);
+        }
+    }
+
+    #[test]
+    fn no_withholding_type_is_rejected() {
+        let mut t = minimal();
+        t.withholding_type.withholding_tax = false;
+        assert!(validate_tax_info(&t).is_err());
+    }
+
+    #[test]
+    fn multiple_errors_are_collected() {
+        let t = TaxInfo::default(); // all empty/false
+        let err = validate_tax_info(&t).unwrap_err();
+        // At minimum: payer.name, payee.name, no pnd, no withholding type
+        assert!(err.errors.len() >= 4);
+    }
+
+    #[test]
+    fn error_display_joins_messages() {
+        let mut t = minimal();
+        t.payer.name = String::new();
+        t.payee.name = String::new();
+        let err = validate_tax_info(&t).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("payer.name is required"));
+        assert!(msg.contains("payee.name is required"));
+        assert!(msg.contains(';')); // joined with "; "
     }
 }

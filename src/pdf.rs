@@ -6,12 +6,12 @@ use lopdf::{Dictionary, Document, Object, Stream};
 use std::collections::HashMap;
 use std::io::{self, Cursor, Write};
 
-pub const PAGE_WIDTH: f64 = 595.28;
-pub const PAGE_HEIGHT: f64 = 841.89;
+pub(crate) const PAGE_WIDTH: f64 = 595.28;
+pub(crate) const PAGE_HEIGHT: f64 = 841.89;
 
 // ── Anchor coordinate system ──────────────────────────────────────────────────
 
-pub fn anchor_to_xy(anchor: Anchor, dx: f64, dy: f64) -> (f64, f64) {
+fn anchor_to_xy(anchor: Anchor, dx: f64, dy: f64) -> (f64, f64) {
     match anchor {
         Anchor::TopLeft => (dx, -dy),
         Anchor::TopCenter => (PAGE_WIDTH / 2.0 + dx, -dy),
@@ -161,7 +161,7 @@ impl GidEncoder {
 
 // ── Main entry point ──────────────────────────────────────────────────────────
 
-pub fn fill_certificate<W: io::Write>(
+pub(crate) fn fill_certificate<W: io::Write>(
     text_fields: Vec<TextField>,
     image_fields: Vec<ImageField>,
     out: &mut W,
@@ -695,16 +695,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_anchor_to_xy_top_left() {
+    fn anchor_top_left_applies_dx_dy_directly() {
         let (x, y) = anchor_to_xy(Anchor::TopLeft, 10.0, 20.0);
         assert_eq!(x, 10.0);
         assert_eq!(y, -20.0);
     }
 
     #[test]
-    fn test_anchor_to_xy_bottom_center() {
+    fn anchor_top_center_centers_horizontally() {
+        let (x, y) = anchor_to_xy(Anchor::TopCenter, 0.0, 0.0);
+        assert!((x - PAGE_WIDTH / 2.0).abs() < 0.01);
+        assert_eq!(y, 0.0);
+    }
+
+    #[test]
+    fn anchor_top_right_starts_at_page_right() {
+        let (x, y) = anchor_to_xy(Anchor::TopRight, 0.0, 0.0);
+        assert!((x - PAGE_WIDTH).abs() < 0.01);
+        assert_eq!(y, 0.0);
+    }
+
+    #[test]
+    fn anchor_left_centers_vertically() {
+        let (x, y) = anchor_to_xy(Anchor::Left, 0.0, 0.0);
+        assert_eq!(x, 0.0);
+        assert!((y - PAGE_HEIGHT / 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn anchor_center_centers_both_axes() {
+        let (x, y) = anchor_to_xy(Anchor::Center, 0.0, 0.0);
+        assert!((x - PAGE_WIDTH / 2.0).abs() < 0.01);
+        assert!((y - PAGE_HEIGHT / 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn anchor_right_starts_at_page_right() {
+        let (x, y) = anchor_to_xy(Anchor::Right, 0.0, 0.0);
+        assert!((x - PAGE_WIDTH).abs() < 0.01);
+        assert!((y - PAGE_HEIGHT / 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn anchor_bottom_left_starts_at_page_bottom() {
+        let (x, y) = anchor_to_xy(Anchor::BottomLeft, 0.0, 0.0);
+        assert_eq!(x, 0.0);
+        assert!((y - PAGE_HEIGHT).abs() < 0.01);
+    }
+
+    #[test]
+    fn anchor_bottom_center_centers_horizontally_at_bottom() {
         let (x, y) = anchor_to_xy(Anchor::BottomCenter, 0.0, 100.0);
         assert!((x - PAGE_WIDTH / 2.0).abs() < 0.01);
         assert!((y - (PAGE_HEIGHT - 100.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn anchor_bottom_right_starts_at_page_right_bottom() {
+        let (x, y) = anchor_to_xy(Anchor::BottomRight, 0.0, 0.0);
+        assert!((x - PAGE_WIDTH).abs() < 0.01);
+        assert!((y - PAGE_HEIGHT).abs() < 0.01);
+    }
+
+    #[test]
+    fn anchor_offsets_are_additive() {
+        let (x, y) = anchor_to_xy(Anchor::Center, 10.0, 5.0);
+        assert!((x - (PAGE_WIDTH / 2.0 + 10.0)).abs() < 0.01);
+        assert!((y - (PAGE_HEIGHT / 2.0 - 5.0)).abs() < 0.01);
     }
 }

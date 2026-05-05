@@ -162,9 +162,9 @@ impl GidEncoder {
 // ── Main entry point ──────────────────────────────────────────────────────────
 
 pub(crate) fn fill_certificate<W: io::Write>(
+    out: &mut W,
     text_fields: Vec<TextField>,
     image_fields: Vec<ImageField>,
-    out: &mut W,
 ) -> Result<()> {
     // Build GID encoder from the embedded font
     let encoder = GidEncoder::new(TH_SARABUN_FONT_DATA).context("build GID encoder")?;

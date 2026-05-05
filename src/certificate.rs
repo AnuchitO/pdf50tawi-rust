@@ -15,7 +15,7 @@ pub fn issue_wht_certificate_pdf<W: io::Write>(
 ) -> Result<()> {
     let images = certificate_image_fields(sign, logo)?;
     let texts = text_fields_from_tax_info(&tax_info);
-    fill_certificate(texts, images, out)
+    fill_certificate(out, texts, images)
 }
 
 /// Returns the positioned image fields for the signature and company seal.

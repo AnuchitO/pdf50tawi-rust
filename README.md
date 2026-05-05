@@ -236,6 +236,9 @@ pub struct TaxInfo {
 ## ไลบรารีที่เกี่ยวข้อง / Related
 
 - [pdf50tawi](https://github.com/AnuchitO/pdf50tawi) — Go version of this library
+- [bahttext](https://github.com/AnuchitO/bahttext) — แปลงตัวเลขเป็นตัวอักษรภาษาไทย (บาท)
+- [currency-formatter](https://github.com/AnuchitO/currency-formatter) — จัดรูปแบบตัวเลขเงินบาท
+- [date-thai-formatter](https://github.com/AnuchitO/date-thai-formatter) — แปลงวันที่เป็นภาษาไทย (พ.ศ., ชื่อเดือนเต็ม/ย่อ)
 
 ---
 
